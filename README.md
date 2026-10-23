@@ -1,3 +1,20 @@
+# godot-ci-dev
+
+A fork of [aBARICHELLO/godot-ci](https://github.com/abarichello/godot-ci) for **official Godot 4.x development / alpha / beta / RC builds (GDScript)**.
+
+The GitHub Actions workflows poll the [official Godot builds releases](https://github.com/godotengine/godot-builds/releases) every 6 hours, build a GHCR Docker image with Godot and export templates, tag it with the **full prerelease version** (for example `4.8-beta1`), and update a moving `preview` tag. They mirror the upstream prerelease in this fork **only after the image is published successfully**.
+
+```bash
+docker pull ghcr.io/fivepebblesgpt/godot-ci-dev:4.8-beta1
+docker run --rm ghcr.io/fivepebblesgpt/godot-ci-dev:4.8-beta1 godot --headless --version
+```
+
+See [PREVIEW-IMAGES.md](PREVIEW-IMAGES.md) for automatic and manual publishing instructions, permissions, caveats, and precise image paths.
+
+This repository retains the upstream Dockerfile and other compatibility files. The automatic preview pipeline publishes only the **GDScript** variant to **GHCR**, not Docker Hub or Mono/.NET images. These are official Godot prerelease binaries, not nightly source builds from the engine's `master` branch.
+
+---
+
 # godot-ci
 Docker image to export Godot Engine games and deploy to GitLab/GitHub Pages and Itch.io using GitLab CI and GitHub Actions.
 
