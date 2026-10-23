@@ -1,95 +1,142 @@
-name: Release
+name: Build Godot Preview Image
+
 on:
+  workflow_call:
+    inputs:
+      godot_tag:
+        description: 'Official godotengine/godot-builds prerelease tag'
+        required: true
+        type: string
+      update_preview:
+        description: 'Also move the preview alias to this release'
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      godot_tag:
+        description: 'Official Godot preview tag (e.g. 4.8-beta1)'
+        required: true
+        type: string
+      update_preview:
+        description: 'Also update the moving preview tag'
+        required: false
+        default: false
+        type: boolean
   release:
-    types: [released]
-env:
-  IMAGE_NAME: godot-ci
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: godot-preview-image-${{ inputs.godot_tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
-  version:
-    name: Get Version
+  validate:
+    name: Validate official Godot preview
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.calculate.outputs.version }}
-      release_name: ${{ steps.calculate.outputs.release_name }}
-      dotnet_version: ${{ steps.calculate.outputs.dotnet_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      release_name: ${{ steps.version.outputs.release_name }}
+      image: ${{ steps.version.outputs.image }}
     steps:
-      - uses: actions/checkout@v3
-      - id: calculate
+      - name: Validate tag and source assets
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.godot_tag || github.event.release.tag_name }}
         run: |
-          REF_NAME=${{ github.ref_name }}
-          VERSION=${REF_NAME%-*}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "release_name=${REF_NAME#*-}" >> $GITHUB_OUTPUT
-          DOTNET_VERSION=$(./get_dotnet_version.sh $VERSION)
-          echo "dotnet_version=$DOTNET_VERSION" >> $GITHUB_OUTPUT
-          echo "$DOTNET_VERSION"
-          
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-(dev|alpha|beta|rc)[0-9]+$ ]]; then
+            echo "Unsupported Godot preview release tag: $tag" >&2
+            exit 1
+          fi
+
+          version="${tag%%-*}"
+          release_name="${tag#*-}"
+          release_json="$(gh api "repos/godotengine/godot-builds/releases/tags/$tag")"
+
+          jq -e '.draft == false and .prerelease == true' <<< "$release_json" >/dev/null
+
+          for asset in "Godot_v${tag}_linux.x86_64.zip" "Godot_v${tag}_export_templates.tpz"; do
+            if ! jq -e --arg filename "$asset" '.assets | any(.name == $filename)' \
+              <<< "$release_json" >/dev/null; then
+              echo "Official release $tag is missing $asset" >&2
+              exit 1
+            fi
+          done
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/godot-ci-dev" >> "$GITHUB_OUTPUT"
+
   build:
-    name: Build Image
+    name: Build and publish GDScript image
+    needs: validate
     runs-on: ubuntu-24.04
-    needs: [version]
     steps:
-      - uses: actions/checkout@v3
-      - run:  echo IMAGE_OWNER=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v1.14.1
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v2.9.0
+
+      - name: Build and push preview image
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: true
+          platforms: linux/amd64
           tags: |
-            ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
-            ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+            ${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.tag }}
+            ${{ inputs.update_preview && format('{0}:preview', needs.validate.outputs.image) || '' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.tag }}
+            org.opencontainers.image.description=Godot GDScript preview CI with export templates
           build-args: |
-            GODOT_VERSION=${{ needs.version.outputs.version }}
-            RELEASE_NAME=${{ needs.version.outputs.release_name }}
-            GODOT_TEST_ARGS=${{ startsWith( needs.version.outputs.version, '3.' ) && '' || '--headless --quit' }}
-            GODOT_PLATFORM=${{ startsWith( needs.version.outputs.version, '3.' ) && 'linux_headless.64' || 'linux.x86_64' }}
-  build-mono:
-    name: Build Mono Image
+            GODOT_VERSION=${{ needs.validate.outputs.version }}
+            RELEASE_NAME=${{ needs.validate.outputs.release_name }}
+            GODOT_PLATFORM=linux.x86_64
+            GODOT_TEST_ARGS=--headless --quit
+
+  mirror-release:
+    name: Mark successfully published preview
+    needs: [validate, build]
+    if: ${{ github.event_name != 'release' }}
     runs-on: ubuntu-24.04
-    needs: [version]
     steps:
-      - uses: actions/checkout@v3
-      - run:  echo IMAGE_OWNER=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v1.14.1
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push Docker images
-        uses: docker/build-push-action@v2.9.0
-        with:
-          context: .
-          file: mono.Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:mono-${{ needs.version.outputs.version }}
-            ghcr.io/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:mono-latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:mono-latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:mono-${{ needs.version.outputs.version }}
-          build-args: |
-            IMAGE=${{ needs.version.outputs.dotnet_version }}
-            GODOT_VERSION=${{ needs.version.outputs.version }}
-            RELEASE_NAME=${{ needs.version.outputs.release_name }}
-            GODOT_ZIP_PLATFORM=${{ startsWith( needs.version.outputs.version, '3.' ) && 'linux_headless_64' || 'linux_x86_64' }}
-            GODOT_PLATFORM=${{ startsWith( needs.version.outputs.version, '3.' ) && 'linux_headless.64' || 'linux.x86_64' }}
+      - name: Create fork release only after image was pushed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GODOT_TAG: ${{ needs.validate.outputs.tag }}
+          IMAGE: ${{ needs.validate.outputs.image }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GODOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Fork release $GODOT_TAG already exists."
+            exit 0
+          fi
+
+          printf -v notes 'Built from official godotengine/godot-builds release %s.\n\nDocker image: `%s:%s`' \
+            "$GODOT_TAG" "$IMAGE" "$GODOT_TAG"
+          gh release create "$GODOT_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Godot $GODOT_TAG CI image" \
+            --notes "$notes" \
+            --prerelease

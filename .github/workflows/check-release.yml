@@ -1,51 +1,85 @@
-name: "Check Releases"
+name: Check Godot Preview Releases
+
 on:
-  schedule:
-    - cron: '27 23 * * *'
   push:
-    branches:
-      - master
+    branches: [master]
+    paths:
+      - '.github/workflows/check-release.yml'
+      - '.github/workflows/release.yml'
+      - 'Dockerfile'
+  schedule:
+    # GitHub schedules are best-effort; official releases cannot trigger other repos directly.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      godot_tag:
+        description: 'Optional official Godot preview tag (e.g. 4.8-beta1); blank means latest'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: godot-preview-check
+  cancel-in-progress: false
+
 jobs:
-  fetch:
-    name: Fetch Latest Godot Engine Release
+  detect:
+    name: Find unpublished Godot preview
     runs-on: ubuntu-24.04
     outputs:
-      release_tag: ${{ steps.parse.outputs.tag }}
-    steps:    
-      - id: parse
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - name: Discover official preview release
+        id: detect
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.godot_tag }}
         run: |
-          TAG=$(gh release view --repo godotengine/godot --json tagName --jq .tagName)
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-  current:
-    name: Fetch Current Godot CI release
-    runs-on: ubuntu-24.04
-    outputs:
-      release_tag: ${{ steps.parse.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-      - id: parse 
-        run: echo "tag=$(git tag --list --sort=-creatordate | head --lines 1)" >> $GITHUB_OUTPUT 
-  create:
-    needs: [fetch, current]
-    name: Create New Godot CI Release
-    runs-on: ubuntu-24.04
-    if: needs.fetch.outputs.release_tag != needs.current.outputs.release_tag 
-    steps:
-      - uses: actions/checkout@v3
-      - run: gh release view --repo godotengine/godot --json body --jq .body | sed 's/\\r\\n/\n/g' > body.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git tag ${{ needs.fetch.outputs.release_tag }}
-          git push
-      - uses: softprops/action-gh-release@v0.1.14
-        with:
-          body_path: body.txt
-          tag_name: ${{ needs.fetch.outputs.release_tag }}
-          token: ${{ secrets.PAT }}
+          set -euo pipefail
+
+          tag="$REQUESTED_TAG"
+          if [[ -z "$tag" ]]; then
+            # The /releases/latest endpoint omits prereleases. Use the full feed.
+            tag="$(gh api 'repos/godotengine/godot-builds/releases?per_page=100' \
+              --jq '[.[] | select(.draft == false and .prerelease == true)
+                          | select(.tag_name | test("^[0-9]+\\.[0-9]+(\\.[0-9]+)?-(dev|alpha|beta|rc)[0-9]+$"))]
+                    | sort_by(.published_at) | last | .tag_name // empty')"
+          fi
+
+          if [[ -z "$tag" ]]; then
+            echo 'No official Godot preview release found.'
+            exit 0
+          fi
+
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-(dev|alpha|beta|rc)[0-9]+$ ]]; then
+            echo "Unsupported preview tag: $tag" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Fork release $tag already exists; image should already be published."
+            echo "To rebuild it, dispatch the Build Godot Preview Image workflow."
+            exit 0
+          fi
+
+          # Do not create releases/tags for nonexistent upstream versions.
+          gh api "repos/godotengine/godot-builds/releases/tags/$tag" \
+            --jq '.prerelease' | grep -qx true
+
+          echo "New upstream preview: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and publish discovered preview
+    needs: detect
+    if: ${{ needs.detect.outputs.tag != '' }}
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/release.yml
+    with:
+      godot_tag: ${{ needs.detect.outputs.tag }}
+      update_preview: true
